@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Locate the computed-goto table used to observe VM dispatch boundaries."""
+import os
 import struct
 
 def _table_values(elf, va):
@@ -19,7 +20,17 @@ def find_handler_table(elf):
 
     Primary: a run of >=256 consecutive R_*_RELATIVE relocations (4-byte slots
     on ELF32, 8-byte on ELF64) whose targets all land in .text. Fallback: raw
-    scan of non-executable sections."""
+    scan of non-executable sections.
+
+    PATCH(mmpfit): the raw-scan fallback can lock onto a window that starts a
+    few slots before the real table, which silently shifts every opcode index.
+    UNMMP_HANDLER_TABLE pins the exact link-time VA when the table has already
+    been located statically."""
+    hint = os.environ.get('UNMMP_HANDLER_TABLE')
+    if hint:
+        va = int(hint, 0)
+        return va, _table_values(elf, va)
+
     ptr = elf.ptr
     rel_t = elf.relative_reloc_type()
     rels = sorted(off for off, typ, _sym, _add in elf.relocs if typ == rel_t)

@@ -129,7 +129,12 @@ class Lifter(object):
         insns_ea = th['insns']
         size = th['size']
         off = self.vaddr_to_off(insns_ea)
-        insns = list(struct.unpack('<%dH' % size, self.so[off: off + size * 2]))
+        # The captured body was decrypted into emulator memory; the ELF image
+        # still holds the ciphertext, so prefer the snapshot when present.
+        if th.get('units') and len(th['units']) >= size:
+            insns = list(th['units'][:size])
+        else:
+            insns = list(struct.unpack('<%dH' % size, self.so[off: off + size * 2]))
         shorty = shorty_of(meth['sig'])
         ok, err, ops = decode(insns, size, shorty, self.mapping)
         if not ok:

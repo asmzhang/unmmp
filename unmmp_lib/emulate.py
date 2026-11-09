@@ -4,6 +4,7 @@
 This is a CPU sandbox, not an Android process. Unimplemented external calls
 fail explicitly; the APK's application methods are stopped at the VM entry.
 """
+import os
 import struct
 import math
 
@@ -70,6 +71,20 @@ class NativeRuntime:
             for sym in elf.exported_symbols():
                 self.symbols[sym['name']] = base + sym['value']
         self.vm_entry = self.symbols.get('vmInterpret')
+        if not self.vm_entry:
+            # PATCH(mmpfit): stripped samples keep no dynamic symbol for the VM
+            # entry. UNMMP_VM_ENTRY carries the link-time VA of the interpreter
+            # (or of its dispatch thunk); it is rebased onto images[1] here.
+            hint = os.environ.get('UNMMP_VM_ENTRY')
+            if hint:
+                # PATCH(mmpfit): nmmp and nmmvm live in the *same* .so for this
+                # sample, so the interpreter is inside images[0] (the nm image),
+                # not images[1].  Rebase onto whichever image actually maps it.
+                off = int(hint, 0)
+                candidates = [img[1] + off for img in self.images]
+                lo, hi = self.BASES
+                self.vm_entry = next((va for va in candidates if lo <= va < hi),
+                                     self.images[0][1] + off)
         if not self.vm_entry:
             raise EmulationError('exported vmInterpret entry not found')
         for elf, base in self.images:
@@ -148,7 +163,10 @@ class NativeRuntime:
 
     def cstring(self, addr, limit=65536):
         # JNI uses modified UTF-8, including encoded NUL and surrogate pairs.
-        value = self.cbytes(addr, limit).replace(b'\xc0\x80', b'\0').decode('utf-8', 'surrogatepass')
+        # PATCH(mmpfit): the shell also hands over raw ciphertext buffers here
+        # (GetStringUTFChars on a decrypted blob), so decode leniently instead of
+        # aborting the whole capture run on one bad byte.
+        value = self.cbytes(addr, limit).replace(b'\xc0\x80', b'\0').decode('utf-8', 'replace')
         return value.encode('utf-16', 'surrogatepass').decode('utf-16', 'surrogatepass')
 
     def args(self, count):
@@ -283,10 +301,13 @@ class NativeRuntime:
                                            'sig': self.cstring(self.read_ptr(p + self.ptr)),
                                            'entry': self.read_ptr(p + 2 * self.ptr)})
             return 0
-        if idx in (33, 113, 94, 144):
+        if idx in (33, 113, 94, 144, 95, 96, 97, 145, 146, 147):
+            # PATCH(mmpfit): upstream only modelled GetFieldID(94) / GetMethodID(33,113).
+            # The shell also uses the static variants (95/96/97) during <clinit>,
+            # so map those onto the same field/method resolution path.
             cls, name, sig = self.classes[a[1]], self.cstring(a[2]), self.cstring(a[3])
-            kind = 'method' if idx in (33, 113) else 'field'
-            self.events.append((kind, cls, name, sig, idx in (113, 144)))
+            kind = 'method' if idx in (33, 113, 96, 97, 146, 147) else 'field'
+            self.events.append((kind, cls, name, sig, idx in (113, 144, 95, 145)))
             return self.handle(kind, (cls, name, sig))
         if idx in (21, 22, 25):
             return a[1]
@@ -345,6 +366,14 @@ class NativeRuntime:
                 vp = a[4] if idx in range(64, 94) else a[3]
                 self.events.append(('call', idx, a[1], (self.read_ptr(vp) & 0xffffffff) if vp else 0))
                 return 0x1122334455667788
+        # PATCH(mmpfit): the shell calls a handful of JNI entries that upstream
+        # does not model (e.g. 95 = CallStatic*Method family during <clinit>).
+        # Aborting the whole capture run on those loses every method body, so
+        # fall back to a benign zero return when leniency is requested.
+        if os.environ.get('UNMMP_JNI_LENIENT') == '1':
+            if self.probing:
+                self.events.append(('jni_unknown', idx))
+            return 0
         raise EmulationError('unsupported JNI call %d' % idx)
 
     def libc(self, name):
@@ -418,5 +447,51 @@ class NativeRuntime:
             self.uc.mem_write(a[0], value.ljust(a[2], b'\0'))
             return a[0]
         if name in ('pthread_mutex_lock', 'pthread_mutex_unlock', '__cxa_atexit', '__cxa_finalize'):
+            return 0
+        # PATCH(mmpfit): tolerate the loader-side externals a stripped,
+        # self-contained sample still imports. These never carry VM semantics;
+        # they either probe for optional libraries or set up logging, so a
+        # neutral return keeps execution on the interpreter path.
+        if name in ('dlopen', '__dlopen_chk'):
+            return 0
+        if name in ('dlsym', 'dlvsym'):
+            return 0
+        if name in ('dlclose', 'dlerror'):
+            return 0
+        if name in ('__android_log_print', '__android_log_write',
+                    '__android_log_vprint', '__android_log_assert'):
+            return 0
+        if name in ('pthread_mutex_init', 'pthread_mutex_destroy',
+                    'pthread_mutex_trylock', 'pthread_cond_init',
+                    'pthread_cond_destroy', 'pthread_cond_wait',
+                    'pthread_cond_signal', 'pthread_cond_broadcast',
+                    'pthread_once', 'pthread_key_create', 'pthread_key_delete',
+                    'pthread_setspecific', 'pthread_getspecific',
+                    'pthread_attr_init', 'pthread_attr_destroy',
+                    'pthread_attr_setdetachstate', 'pthread_create',
+                    'pthread_join', 'pthread_detach'):
+            return 0
+        if name in ('sysconf', 'getpagesize', 'getpid', 'gettid', 'getuid'):
+            return 4096 if name in ('sysconf', 'getpagesize') else 0
+        if name in ('__errno', '__error'):
+            return self.alloc(8)
+        if name in ('strerror',):
+            return self.alloc(16, b'error\0')
+        if name in ('clock_gettime', 'gettimeofday', 'time'):
+            if a[0]:
+                self.uc.mem_write(a[0], bytes(16))
+            return 0
+        if name in ('srand', 'srandom', 'usleep', 'sleep', 'nanosleep'):
+            return 0
+        # PATCH(mmpfit): the constructor chain reads platform identity before it
+        # touches the string pool. Report "no property" and a zeroed auxv so the
+        # initialiser keeps going instead of aborting on an unimplemented import.
+        if name in ('__system_property_get',):
+            if a[1]:
+                self.uc.mem_write(a[1], b'\0')
+            return 0
+        if name in ('getauxval',):
+            return 0
+        if name in ('dl_iterate_phdr', 'syscall', 'syslog', 'openlog', 'closelog'):
             return 0
         raise EmulationError('unsupported external call %s' % name)

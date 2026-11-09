@@ -138,7 +138,9 @@ class Dex:
                 if span is None or pc+span>n:
                     break
                 if op in (0x72,0x78):
-                    cls = 'L'+self.methods[ins[pc+1]][0]+';'
-                    result[cls] = True
+                    idx = ins[pc+1]
+                    if 0 <= idx < len(self.methods):
+                        cls = 'L'+self.methods[idx][0]+';'
+                        result[cls] = True
                 pc+=span
         return result

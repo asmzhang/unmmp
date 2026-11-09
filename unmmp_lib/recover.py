@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Recover native boundaries and symbols by executing the APK's own code."""
+import os
 import struct
 
 from .dex import Dex
@@ -21,6 +22,11 @@ class Recovery:
         self.sessions = {}
 
     def extract(self):
+        self.bind()
+        self.capture()
+        return self
+
+    def bind(self):
         r = self.runtime
         entry = r.symbols.get('JNI_OnLoad')
         if not entry:
@@ -46,65 +52,125 @@ class Recovery:
         if not self.methods:
             raise EmulationError('no protected methods registered from dex call sites')
         self.log('[*] native bindings validated: %d' % len(self.methods))
+        return self
+
+
+    def _reset_flag(self, entry):
+        """Clear the one-shot decrypt flag in front of a lazy thunk.
+
+        Each wrapper is guarded by a per-method flag: the first call runs an XOR
+        decrypt stub that writes the real body into a scratch buffer and falls
+        through into the implementation; later calls jump straight to the
+        implementation and reuse whatever the buffer holds.  A capture run must
+        therefore force the flag back to 0 for every method, otherwise a thunk
+        shared by several dex methods (or one already touched by an earlier
+        probe) hands back a stale or still-encrypted buffer.
+        """
+        import capstone
+        r = self.runtime
+        try:
+            code = bytes(r.uc.mem_read(entry, 4 * 24))
+        except Exception:
+            return None
+        md = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+        base = None
+        for ins in md.disasm(code, entry):
+            if ins.mnemonic == 'adrp' and ins.op_str.startswith('x8,'):
+                base = int(ins.op_str.split('#', 1)[1], 0)
+            elif base is not None and ins.mnemonic == 'add' and ins.op_str.startswith('x8, x8, #'):
+                base += int(ins.op_str.rsplit('#', 1)[1], 0)
+            elif base is not None and ins.mnemonic in ('ldar', 'ldr') and '[x8]' in ins.op_str:
+                r.uc.mem_write(base, b'\0\0\0\0')
+                return base
+        return None
+
+    def capture(self):
+        r = self.runtime
+        self.failures = []
         r.capture_vm = True
         this_handle = r.handle('object', 'this')
         temporary = r.heap_next
         for i, m in enumerate(self.methods):
             r.heap_next = temporary
-            r.vm_call = None
-            # Also survives jboolean/jbyte/jchar/jshort argument narrowing.
-            marker = 0x5b
-            marker64 = marker | marker << 32
-            if r.machine == 183:
-                for j in range(8):
-                    r.uc.reg_write(getattr(aa, 'UC_ARM64_REG_D%d' % j), marker64)
-            elif r.machine == 62:
-                for j in range(8):
-                    r.uc.reg_write(getattr(xx, 'UC_X86_REG_XMM%d' % j), marker64)
-            params = m['sig'][1:m['sig'].index(')')]
-            static = bool(self.definitions[(m['class'], m['name'], m['sig'])][0] & 8)
-            ins_words = type_words(params) + int(not static)
-            r.call(m['entry'], [r.env, this_handle] + [marker] * max(32, ins_words + 4))
-            if r.vm_call is None:
-                raise EmulationError('native method did not reach VM entry: %s' % m['name'])
-            args = r.vm_call
-            code, resolver = args[2:4] if r.ptr == 4 else args[1:3]
-            insns = r.read_ptr(code)
-            size = int.from_bytes(r.uc.mem_read(code + r.ptr, 4), 'little')
-            regs = r.read_ptr(code + 2 * r.ptr)
-            flags = r.read_ptr(code + 3 * r.ptr)
-            tries = r.read_ptr(code + 4 * r.ptr)
-            nregs = (flags-regs)//8 if flags > regs and (flags-regs)%8 == 0 else None
-            if ins_words and nregs is None:
-                region_end = r.STACK + 0x200000 if r.STACK <= regs < r.STACK + 0x200000 else r.heap_next
-                limit = min(65536, (region_end-regs)//8)
-                frame = bytes(r.uc.mem_read(regs, 8*limit))
-                parameter_marker = marker if static else this_handle
-                found = next((j for j in range(limit)
-                              if struct.unpack_from('<I', frame, 8*j)[0] == parameter_marker), None)
-                if found is None:
-                    raise EmulationError('could not recover parameter register position: %s' % m['name'])
-                nregs = found + ins_words
-            if not (0 < size < 0x100000 and r.BASES[0] <= insns < r.BASES[1]):
-                raise EmulationError('invalid captured vmCode for %s' % m['name'])
-            va = insns - r.BASES[0]
-            off = self.nm.vaddr_to_off(va)
-            if off + 2*size > len(self.nm.data):
-                raise EmulationError('captured instructions exceed ELF image')
-            self.blobs[m['thunk']] = {'insns': va, 'size': size,
-                                     'tries': tries - r.BASES[0] if tries else None,
-                                     'nregs': nregs}
-            m['resolver'] = resolver
-            self.sessions.setdefault(resolver, Pools())
-            if (i+1) % 2000 == 0:
-                self.log('[*] captured blobs: %d/%d' % (i+1, len(self.methods)))
+            # PATCH(mmpfit): several dex methods can share one wrapper thunk, and
+            # the shell decrypts each body into a *shared* scratch buffer that is
+            # only rewritten while the per-method flag is still 0. Calling a thunk
+            # a second time therefore re-reads whatever the previous method left
+            # behind (ciphertext or a foreign body), so capture each thunk once.
+            self._reset_flag(m['entry'])
+            # PATCH(mmpfit): a single unmapped method must not abort a
+            # 1500-method run; UNMMP_CAPTURE_TOLERANT records and skips.
+            try:
+                r.vm_call = None
+                # Also survives jboolean/jbyte/jchar/jshort argument narrowing.
+                marker = 0x5b
+                marker64 = marker | marker << 32
+                if r.machine == 183:
+                    for j in range(8):
+                        r.uc.reg_write(getattr(aa, 'UC_ARM64_REG_D%d' % j), marker64)
+                elif r.machine == 62:
+                    for j in range(8):
+                        r.uc.reg_write(getattr(xx, 'UC_X86_REG_XMM%d' % j), marker64)
+                params = m['sig'][1:m['sig'].index(')')]
+                static = bool(self.definitions[(m['class'], m['name'], m['sig'])][0] & 8)
+                ins_words = type_words(params) + int(not static)
+                r.call(m['entry'], [r.env, this_handle] + [marker] * max(32, ins_words + 4))
+                if r.vm_call is None:
+                    raise EmulationError('native method did not reach VM entry: %s' % m['name'])
+                args = r.vm_call
+                code, resolver = args[2:4] if r.ptr == 4 else args[1:3]
+                insns = r.read_ptr(code)
+                size = int.from_bytes(r.uc.mem_read(code + r.ptr, 4), 'little')
+                regs = r.read_ptr(code + 2 * r.ptr)
+                flags = r.read_ptr(code + 3 * r.ptr)
+                tries = r.read_ptr(code + 4 * r.ptr)
+                nregs = (flags-regs)//8 if flags > regs and (flags-regs)%8 == 0 else None
+                if ins_words and nregs is None:
+                    region_end = r.STACK + 0x200000 if r.STACK <= regs < r.STACK + 0x200000 else r.heap_next
+                    limit = min(65536, (region_end-regs)//8)
+                    frame = bytes(r.uc.mem_read(regs, 8*limit))
+                    parameter_marker = marker if static else this_handle
+                    found = next((j for j in range(limit)
+                                  if struct.unpack_from('<I', frame, 8*j)[0] == parameter_marker), None)
+                    if found is None:
+                        raise EmulationError('could not recover parameter register position: %s' % m['name'])
+                    nregs = found + ins_words
+                if not (0 < size < 0x100000 and r.BASES[0] <= insns < r.BASES[1]):
+                    raise EmulationError('invalid captured vmCode for %s' % m['name'])
+                va = insns - r.BASES[0]
+                off = self.nm.vaddr_to_off(va)
+                if off + 2*size > len(self.nm.data):
+                    raise EmulationError('captured instructions exceed ELF image')
+                # The decrypt stub writes the real body into emulator memory;
+                # the ELF image still holds the ciphertext, so the live buffer is
+                # the only place the plaintext exists. Snapshot it per call.
+                live = bytes(r.uc.mem_read(insns, 2 * size))
+                m['units'] = list(struct.unpack('<%dH' % size, live))
+                m['resolver'] = resolver
+                self.blobs[m['thunk']] = {'units': m['units'],
+                                         'insns': va, 'size': size,
+                                         'tries': tries - r.BASES[0] if tries else None,
+                                         'nregs': nregs, 'resolver': resolver}
+                m['resolver'] = resolver
+                self.sessions.setdefault(resolver, Pools())
+                if (i+1) % 2000 == 0:
+                    self.log('[*] captured blobs: %d/%d' % (i+1, len(self.methods)))
+            except EmulationError as exc:
+                if os.environ.get('UNMMP_CAPTURE_TOLERANT') != '1':
+                    raise
+                self.failures.append({'class': m['class'], 'name': m['name'],
+                                      'sig': m['sig'], 'error': str(exc)})
+                continue
         r.heap_next = temporary
         r.capture_vm = False
-        self.log('[*] blobs captured: %d/%d (%d resolvers)' %
-                 (len(self.blobs), len(self.methods), len(self.sessions)))
+        self.log('[*] blobs captured: %d/%d (%d resolvers, %d skipped)' %
+                 (len(self.blobs), len(self.methods), len(self.sessions),
+                  len(self.failures)))
         return self
 
     def instructions(self, method):
+        if method.get('units'):
+            return method['units']
         th = self.blobs[method['thunk']]
         return struct.unpack_from('<%dH' % th['size'], self.nm.data,
                                   self.nm.vaddr_to_off(th['insns']))
@@ -143,6 +209,7 @@ class Recovery:
         return value
 
     def resolve_references(self, mapping):
+        self.methods = [m for m in self.methods if m['thunk'] in self.blobs]
         failures = []
         for m in self.methods:
             th = self.blobs[m['thunk']]
@@ -152,23 +219,36 @@ class Recovery:
                 failures.append((m['class']+'.'+m['name'], error))
                 continue
             for pc, op, name, size in ops:
-                if name.startswith(('iget', 'iput', 'sget', 'sput')):
-                    self.resolve(m['resolver'], 0, ins[pc+1], name[0] == 's')
-                elif name.startswith('invoke-'):
-                    self.resolve(m['resolver'], 1, ins[pc+1], name.startswith('invoke-static'))
-                elif name in ('const-string', 'const-string/jumbo'):
-                    idx = ins[pc+1] | (ins[pc+2]<<16 if size == 3 else 0)
-                    self.resolve(m['resolver'], 5, idx)
-                elif name in ('const-class', 'new-instance', 'new-array', 'check-cast',
-                              'instance-of', 'filled-new-array', 'filled-new-array/range'):
-                    self.resolve(m['resolver'], 2, ins[pc+1])
+                # A single unresolvable index must not abandon the whole corpus:
+                # the reference simply stays symbolic in the lifted output.
+                try:
+                    if name.startswith(('iget', 'iput', 'sget', 'sput')):
+                        self.resolve(m['resolver'], 0, ins[pc+1], name[0] == 's')
+                    elif name.startswith('invoke-'):
+                        self.resolve(m['resolver'], 1, ins[pc+1], name.startswith('invoke-static'))
+                    elif name in ('const-string', 'const-string/jumbo'):
+                        idx = ins[pc+1] | (ins[pc+2]<<16 if size == 3 else 0)
+                        self.resolve(m['resolver'], 5, idx)
+                    elif name in ('const-class', 'new-instance', 'new-array', 'check-cast',
+                                  'instance-of', 'filled-new-array', 'filled-new-array/range'):
+                        self.resolve(m['resolver'], 2, ins[pc+1])
+                except EmulationError as exc:
+                    if os.environ.get('UNMMP_CAPTURE_TOLERANT'):
+                        continue
+                    raise
             for start, end, handlers in parse_tries(self.nm.data, self.nm.vaddr_to_off, th['tries']):
                 for idx, pc in handlers:
-                    if idx is not None:
+                    if idx is None:
+                        continue
+                    try:
                         self.resolve(m['resolver'], 2, idx)
+                    except EmulationError:
+                        if not os.environ.get('UNMMP_CAPTURE_TOLERANT'):
+                            raise
         return failures
 
     def refine_invokes(self, mapping):
+        self.methods = [m for m in self.methods if m['thunk'] in self.blobs]
         """Use dex class metadata to distinguish equivalent JNI call bodies."""
         kinds = {k:v for d in self.dexes for k,v in d.referenced_interfaces().items()}
         votes = {}
@@ -189,6 +269,7 @@ class Recovery:
         return kinds
 
     def refine_returns(self, mapping):
+        self.methods = [m for m in self.methods if m['thunk'] in self.blobs]
         kinds = {}
         for m in self.methods:
             ins = self.instructions(m)

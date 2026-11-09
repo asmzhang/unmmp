@@ -126,7 +126,10 @@ def payload_units(insns, pc):
     return n
 
 
-def decode(insns, size, shorty, mapping):
+DEFAULT_WIDTHS = {}
+
+
+def decode(insns, size, shorty, mapping, widths=None):
     """Walk instructions; return (ok, err, ops). ops = [(pc, opcode_val, name, size)].
 
     Payload blocks (packed-switch 0x0100, sparse-switch 0x0200, array-data
@@ -150,6 +153,14 @@ def decode(insns, size, shorty, mapping):
         opv = inst & 0xff
         name = mapping.get(opv)
         if name is None:
+            # An opcode the semantic probe could not name yet. The interpreter
+            # trace tells us how many code units it consumes, which is enough to
+            # keep walking the rest of the method instead of discarding it.
+            w = (widths or DEFAULT_WIDTHS).get(opv)
+            if w:
+                ops.append((pc, opv, 'UNKNOWN', w))
+                pc += w
+                continue
             return False, 'UNKNOWN op %#04x at pc=%d' % (opv, pc), ops
         if name in ('UNUSED', '?'):
             return False, '%s op %#04x at pc=%d' % (name, opv, pc), ops

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Dalvik effects used as the oracle for native single-instruction trials."""
 import math
+import os
 import struct
 
 from .decoder import FMT
@@ -184,6 +185,14 @@ def structural_name(trace, high):
             return ('s' if static else 'i') + 'put-wide'
         return ('s' if static else 'i') + ('get' if get else 'put') + ('-wide' if js & {101, 103, 110, 112, 151, 153, 160, 162} else '')
     if resolve and resolve[0][1] == 1:
+        # PATCH(mmpfit): a method resolution alone does not make an opcode an
+        # invoke. Randomised dex-vm builds reuse the resolver for instructions
+        # that merely carry a method reference (const-method-handle,
+        # invoke-custom, or even a branch whose operand happens to decode as
+        # one). Require an actual Call*Method to have been observed before
+        # claiming invoke-*, otherwise fall through to the numerical matcher.
+        if not js & set(range(34, 94)) and not js & set(range(114, 144)):
+            return None
         static = bool(resolve[0][3])
         base = 'invoke-static' if static else 'invoke-virtual' if js & set(range(34, 64)) else 'invoke-nonvirtual'
         return base  # range and nonvirtual kind need dedicated trials/corpus
@@ -223,7 +232,14 @@ def structural_name(trace, high):
 
 
 def effect_matches(name, high, words, values, trace):
-    if trace['error'] or trace['events'] or trace['return']:
+    # PATCH(mmpfit): 'resolve' entries only record that the interpreter asked
+    # the resolver for a field/method/string; they do not change any vreg. A
+    # randomised build can carry a resolver id on an instruction that still
+    # behaves like a plain arithmetic op, so only side-effecting events
+    # (jni, call, throw) disqualify a numerical match.
+    if trace['error'] or trace['return']:
+        return False
+    if any(e[0] in ('jni', 'call', 'throw') for e in trace['events']):
         return False
     try:
         effect = numeric_effect(name, high, words, values)
@@ -268,11 +284,22 @@ def derive_semantic(probe, log=print):
     mixed = [bank[i % len(bank)] for i in range(65536)]
     reverse = [bank[(i+3) % len(bank)] for i in range(65536)]
     zeros = [(0, 1, 0xffffffff, 0x7fffffff, 0x80000000, 3, 7, 19)[i % 8] for i in range(65536)]
+    # PATCH(mmpfit): float denormals make integral and float32 addition produce
+    # the SAME bit pattern.  With the small-integer bank above, add-int and
+    # add-float/2addr both write 0x3d for high=0x21, so whichever candidate is
+    # tried first wins and the map fills with aliases (aget x7, const-string
+    # x4, ...).  A bank whose words land in the normal float range breaks the
+    # tie: 0x40000011 + 0x40000022 is 0x80000033 as int and 0x4080001a as
+    # float.  Kept as an extra trial so the small-integer pass still anchors
+    # the ops whose operands are immediates rather than float bit patterns.
+    f32 = [(0x40000000 + i * 17) & 0xffffffff for i in range(65536)]
     trials = [(0x21, (0x0302,0,0,0), normal),
               (0x32, (0x0504,0,0,0), mixed),
               (0x12, (0x0302,0,0,0), reverse),
               (0x21, (0x0302,0,0,0), zeros),
-              (0x32, (0x0504,1,0x2345,0x6789), normal)]
+              (0x32, (0x0504,1,0x2345,0x6789), normal),
+              (0x21, (0x0302,0,0,0), f32),
+              (0x32, (0x0504,0,0,0), f32)]
     mapping, candidates, traces, cache = {}, {}, {}, {}
     probe.aliases = {}
     for op in range(256):
@@ -393,6 +420,11 @@ def derive_semantic(probe, log=print):
         exc = EmulationError('semantic opcode ambiguity (%d): %s' %
                              (len(unknown), ', '.join('%#x' % op for op in unknown)))
         exc.diagnostics = unknown
-        raise exc
-    log('[*] semantic opcode map: 256 values / %d names' % len(set(mapping.values())))
+        # PATCH(mmpfit): a forked build only needs the opcodes its own methods
+        # actually use, so let callers keep a partial map instead of throwing
+        # everything away.
+        if not os.environ.get('UNMMP_ALLOW_PARTIAL'):
+            raise exc
+        log('[!] partial map: %d/%d opcodes unresolved' % (len(unknown), 256))
+    log('[*] semantic opcode map: %d values / %d names' % (len(mapping), len(set(mapping.values()))))
     return mapping
