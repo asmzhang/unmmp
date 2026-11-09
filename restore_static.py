@@ -28,7 +28,7 @@ from unmmp_lib.semantic import derive_semantic      # noqa: E402
 from unmmp_lib.lifter import Lifter                 # noqa: E402
 from unmmp_lib.recover_static import StaticRecovery  # noqa: E402
 from unmmp_lib.pipeline import method_info, write_json  # noqa: E402
-from unmmp_lib.rebuild import rebuild                # noqa: E402
+from unmmp_lib.rebuild import rebuild, rebuild_from_tree   # noqa: E402
 
 DEFAULT_VM = '0x3150c8'
 DEFAULT_TABLE = '0x364540'
@@ -73,6 +73,10 @@ def main(argv=None):
     parser.add_argument('--names', help='regid_names.json from resolve_names.py')
     parser.add_argument('--no-dex', action='store_true',
                         help='stop after lifting; do not assemble restored dex files')
+    parser.add_argument('--smali-root', action='append', default=None,
+                        metavar='DIR',
+                        help='patch these existing smali trees instead of running '
+                             'baksmali; repeat once per dex, in dex order')
     parser.add_argument('--tools', default=str(HERE / 'tools'),
                         help='directory holding baksmali-*.jar and smali-*.jar')
     args = parser.parse_args(argv)
@@ -205,7 +209,13 @@ def main(argv=None):
         # The dex is the actual deliverable; everything above is evidence. Methods
         # whose body still holds UNKNOWN operands stay native and are listed in
         # recovery_summary.json rather than aborting the run.
-        dex_summary = rebuild(dex_raw, lifted, args.out, args.tools)
+        if args.smali_root:
+            roots = []
+            for i, root in enumerate(args.smali_root):
+                roots.append(('classes' if i == 0 else 'classes%d' % (i + 1), root))
+            dex_summary = rebuild_from_tree(roots, lifted, args.out, args.tools)
+        else:
+            dex_summary = rebuild(dex_raw, lifted, args.out, args.tools)
         summary.update(dex_summary)
         print('[*] restored dex files: %d, patched methods: %d'
               % (len(dex_summary['dex_files']), dex_summary['patched']))
