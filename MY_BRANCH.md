@@ -122,8 +122,18 @@ indices past the method table.
 | `check_dup.py` | group mapped opcodes by handler, separating family aliases from real mislabels |
 | `resolve_names.py` | decode the method table's name/signature indices into a JSON map |
 | `dump_strpool.py` | run `.init_array`, then dump the decrypted string pool |
+| `scan_regids.py` | recover the `<clinit>` self-registration table (`class → id`) from a smali tree |
 
 ## Running it
+
+Step 0 — recover the class→id map from the smali tree (the helper method is
+renamed per build, so pass its name):
+
+```bash
+python scan_regids.py <smali_root> -o regid_map.tsv --register-method mPdUI2cA5Z
+```
+
+Then:
 
 ```bash
 export UNMMP_VM_ENTRY=0x3150c8        # interpreter entry (from static analysis)
