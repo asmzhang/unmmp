@@ -118,13 +118,18 @@ def main(argv=None):
 
     if args.widths:
         # Widths come from watching the interpreter advance x22 on real bodies
-        # (harvest_widths.py); without them a single unrecognised opcode would
-        # discard the whole method.
+        # (harvest_widths.py) or from measuring it on a device (sweep_dev.py).
+        # Two shapes are accepted: {op: width} from the device sweep, and
+        # {op: {width: votes}} from the voting harvester.
         from unmmp_lib import decoder
+
+        def _width(v):
+            if isinstance(v, int):
+                return v
+            return int(max(v.items(), key=lambda kv: kv[1])[0])
+
         table = json.load(open(args.widths, encoding='utf-8'))
-        decoder.DEFAULT_WIDTHS.update(
-            {int(k, 16): int(max(v.items(), key=lambda kv: kv[1])[0])
-             for k, v in table.items()})
+        decoder.DEFAULT_WIDTHS.update({int(k, 16): _width(v) for k, v in table.items()})
         print('[*] widths (loaded) = %d' % len(decoder.DEFAULT_WIDTHS))
 
     recovery.capture()
@@ -217,8 +222,10 @@ def main(argv=None):
         else:
             dex_summary = rebuild(dex_raw, lifted, args.out, args.tools)
         summary.update(dex_summary)
-        print('[*] restored dex files: %d, patched methods: %d'
-              % (len(dex_summary['dex_files']), dex_summary['patched']))
+        print('[*] restored dex files: %d, syntax-patched: %d, '
+              'semantically verified: %d, kept native: %d'
+              % (len(dex_summary['dex_files']), dex_summary['syntax_patched'],
+                 dex_summary['semantic_verified'], dex_summary['kept_native']))
     write_json(os.path.join(args.out, 'recovery_summary.json'), summary)
     return 0
 

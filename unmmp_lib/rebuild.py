@@ -72,8 +72,71 @@ def _register_count(body, declared, sig='', is_static=False):
     return max([declared, _param_registers(sig, is_static)] + [n + 1 for n in used])
 
 
-def _patch_class(path, cls, methods, failures):
-    """Replace native declarations with lifted bodies; return the patch count."""
+_RETURN_OF = {'V': 'return-void', 'Z': 'return', 'B': 'return', 'S': 'return',
+              'C': 'return', 'I': 'return', 'F': 'return',
+              'J': 'return-wide', 'D': 'return-wide'}
+
+
+def _expected_return(sig):
+    tail = sig[sig.rindex(')') + 1:]
+    if tail.startswith('[') or tail.startswith('L'):
+        return 'return-object'
+    return _RETURN_OF.get(tail[:1])
+
+
+def _body_ops(body):
+    out = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith(':') or line.startswith('.'):
+            continue
+        out.append(line)
+    return out
+
+
+def verify_body(body, sig, is_static=False, declared=0):
+    """Decide whether a lifted body may replace a native declaration.
+
+    A body that merely assembles is not a restored method: the lifter emits
+    operands using the *standard* Dalvik format of whatever name it guessed,
+    so a wrong name yields a body that is syntactically valid but
+    semantically nonsense (e.g. a method returning V replaced by
+    ``return-void``, or a value-returning method replaced by ``return-void``).
+    Anything that fails a check keeps its ``native`` declaration.
+
+    Returns ``(ok, reason)``.
+    """
+    if 'UNKNOWN' in body:
+        return False, 'unresolved opcodes in body'
+    ops = _body_ops(body)
+    if not ops:
+        return False, 'empty body'
+    last = ops[-1].split()[0]
+    want = _expected_return(sig)
+    if last != 'throw':
+        if want is None:
+            return False, 'unparsable return type'
+        if last != want:
+            return False, 'return mismatch: body ends with %s, signature wants %s' % (last, want)
+    used = [int(n) for n in _VREG.findall(body)]
+    if used:
+        top = max(used)
+        if top > 65535:
+            return False, 'register index v%d out of range' % top
+        if top >= 1000:
+            return False, 'implausible register index v%d' % top
+        if declared and top < declared and top >= 1000:
+            return False, 'register index v%d exceeds declared %d' % (top, declared)
+    return True, ''
+
+
+def _patch_class(path, cls, methods, failures, stats=None):
+    """Replace native declarations with lifted bodies; return the patch count.
+
+    Only bodies that pass :func:`verify_body` are written. ``stats`` collects
+    ``syntax_patched`` (bodies that were UNKNOWN-free and matched a native
+    declaration) and ``semantic_verified`` (the subset actually written).
+    """
     with open(path, encoding='utf-8') as handle:
         text = handle.read()
     patched = 0
@@ -91,12 +154,23 @@ def _patch_class(path, cls, methods, failures):
         if not re.search(r'\bnative\b', head):
             failures.append([cls, label, 'declaration is not native'])
             continue
+        if stats is not None:
+            stats['syntax_patched'] = stats.get('syntax_patched', 0) + 1
+        ok, reason = verify_body(m['body'], m['sig'], m.get('static', False),
+                                 m.get('regs', 0))
+        if not ok:
+            failures.append([cls, label, 'kept native: ' + reason])
+            if stats is not None:
+                stats['kept_native'] = stats.get('kept_native', 0) + 1
+            continue
         head = re.sub(r'\bnative[ \t]*', '', head).rstrip()
         regs = _register_count(m['body'], m['regs'], m['sig'], m['static'])
         body = (head + '\n    .registers %d\n' % regs +
                 match.group(2) + '\n' + m['body'] + '\n.end method')
         text = text[:match.start()] + body + text[match.end():]
         patched += 1
+        if stats is not None:
+            stats['semantic_verified'] = stats.get('semantic_verified', 0) + 1
     if patched:
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write(text)
@@ -137,7 +211,8 @@ def rebuild_from_tree(roots, lifted, out, tools, log=print, api=28):
     work = os.path.join(out, 'work')
     os.makedirs(work, exist_ok=True)
 
-    summary = {'dex_files': [], 'patched': 0, 'patch_failures': [],
+    summary = {'dex_files': [], 'syntax_patched': 0, 'semantic_verified': 0,
+               'kept_native': 0, 'patch_failures': [],
                'dex_sources': {}, 'verified': [], 'missing_classes': []}
     patched_dirs = []
     index = {}
@@ -156,10 +231,13 @@ def rebuild_from_tree(roots, lifted, out, tools, log=print, api=28):
         if not path:
             missing.add(cls)
             continue
-        summary['patched'] += _patch_class(path, cls, methods, summary['patch_failures'])
+        summary['semantic_verified'] += _patch_class(
+            path, cls, methods, summary['patch_failures'], summary)
     summary['missing_classes'] = sorted(missing)
-    log('[*] patched methods: %d (%d class(es) not found)'
-        % (summary['patched'], len(missing)))
+    log('[*] syntax-patched %d, semantically verified %d, kept native %d'
+        ' (%d class(es) not found)'
+        % (summary['syntax_patched'], summary['semantic_verified'],
+           summary['kept_native'], len(missing)))
 
     next_dex = 1
     for stem, patched_dir in patched_dirs:
@@ -185,7 +263,8 @@ def rebuild(dexes, lifted, out, tools, log=print):
     work = os.path.join(out, 'work')
     os.makedirs(work, exist_ok=True)
 
-    summary = {'dex_files': [], 'patched': 0, 'patch_failures': [],
+    summary = {'dex_files': [], 'syntax_patched': 0, 'semantic_verified': 0,
+               'kept_native': 0, 'patch_failures': [],
                'dex_sources': {}, 'verified': []}
     next_dex = 1
     for name, raw in dexes:
@@ -220,9 +299,10 @@ def rebuild(dexes, lifted, out, tools, log=print):
             path = os.path.join(patched_dir, cls.replace('/', os.sep) + '.smali')
             if not os.path.isfile(path):
                 continue                     # class belongs to another dex
-            count += _patch_class(path, cls, methods, summary['patch_failures'])
-        log('[*] %s patched methods: %d' % (name, count))
-        summary['patched'] += count
+            count += _patch_class(path, cls, methods, summary['patch_failures'],
+                                  summary)
+        log('[*] %s semantically verified: %d' % (name, count))
+        summary['semantic_verified'] += count
 
         outputs = assemble_tree(patched_dir, out, stem, jars['smali'], next_dex,
                                 log, api=_dex_api(raw))
