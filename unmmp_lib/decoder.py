@@ -128,6 +128,18 @@ def payload_units(insns, pc):
 
 DEFAULT_WIDTHS = {}
 
+# Opcodes whose handler was read and found to use the Dalvik 3rc layout: the
+# argument-word count sits in the high byte of the first unit, so the width is
+# data dependent and no fixed table can ever be right for them. Layout:
+#   unit0 = AA|op   unit1 = BBBB (method)   unit2.. = CCCC register list
+# Total units = 2 + ceil(AA/2).
+INVOKE_RANGE = set()
+
+
+def _invoke_range_width(inst):
+    aa = (inst >> 8) & 0xff
+    return 2 + (aa + 1) // 2
+
 
 def decode(insns, size, shorty, mapping, widths=None):
     """Walk instructions; return (ok, err, ops). ops = [(pc, opcode_val, name, size)].
@@ -153,6 +165,12 @@ def decode(insns, size, shorty, mapping, widths=None):
         opv = inst & 0xff
         name = mapping.get(opv)
         if name is None:
+            if opv in INVOKE_RANGE:
+                w = _invoke_range_width(inst)
+                if pc + w <= size:
+                    ops.append((pc, opv, 'invoke-range?', w))
+                    pc += w
+                    continue
             # An opcode the semantic probe could not name yet. The interpreter
             # trace tells us how many code units it consumes, which is enough to
             # keep walking the rest of the method instead of discarding it.
