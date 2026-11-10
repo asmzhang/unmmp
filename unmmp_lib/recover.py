@@ -218,20 +218,25 @@ class Recovery:
             if not ok:
                 failures.append((m['class']+'.'+m['name'], error))
                 continue
+            res = m.get('resolver')
+            if res is None:
+                # Statically bound methods have no captured resolver session, so
+                # their references stay symbolic instead of crashing the pass.
+                continue
             for pc, op, name, size in ops:
                 # A single unresolvable index must not abandon the whole corpus:
                 # the reference simply stays symbolic in the lifted output.
                 try:
                     if name.startswith(('iget', 'iput', 'sget', 'sput')):
-                        self.resolve(m['resolver'], 0, ins[pc+1], name[0] == 's')
+                        self.resolve(res, 0, ins[pc+1], name[0] == 's')
                     elif name.startswith('invoke-'):
-                        self.resolve(m['resolver'], 1, ins[pc+1], name.startswith('invoke-static'))
+                        self.resolve(res, 1, ins[pc+1], name.startswith('invoke-static'))
                     elif name in ('const-string', 'const-string/jumbo'):
                         idx = ins[pc+1] | (ins[pc+2]<<16 if size == 3 else 0)
-                        self.resolve(m['resolver'], 5, idx)
+                        self.resolve(res, 5, idx)
                     elif name in ('const-class', 'new-instance', 'new-array', 'check-cast',
                                   'instance-of', 'filled-new-array', 'filled-new-array/range'):
-                        self.resolve(m['resolver'], 2, ins[pc+1])
+                        self.resolve(res, 2, ins[pc+1])
                 except EmulationError as exc:
                     if os.environ.get('UNMMP_CAPTURE_TOLERANT'):
                         continue
@@ -241,7 +246,7 @@ class Recovery:
                     if idx is None:
                         continue
                     try:
-                        self.resolve(m['resolver'], 2, idx)
+                        self.resolve(res, 2, idx)
                     except EmulationError:
                         if not os.environ.get('UNMMP_CAPTURE_TOLERANT'):
                             raise

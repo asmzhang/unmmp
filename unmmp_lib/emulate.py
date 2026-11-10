@@ -290,7 +290,10 @@ class NativeRuntime:
         if idx == 6:  # FindClass
             name = self.cstring(a[1])
             self.events.append(('class', name))
-            return self.handle('class', name)
+            got = self.handle('class', name)
+            if not got and os.environ.get('UNMMP_JNI_FAKE') == '1':
+                got = self._fake_id('class', name)
+            return got
         if idx == 215:  # RegisterNatives
             cls = self.classes[a[1]]
             if a[3] > 100000:
@@ -308,7 +311,15 @@ class NativeRuntime:
             cls, name, sig = self.classes[a[1]], self.cstring(a[2]), self.cstring(a[3])
             kind = 'method' if idx in (33, 113, 96, 97, 146, 147) else 'field'
             self.events.append((kind, cls, name, sig, idx in (113, 144, 95, 145)))
-            return self.handle(kind, (cls, name, sig))
+            got = self.handle(kind, (cls, name, sig))
+            # PATCH(mmpfit): a null jfieldID/jmethodID makes the resolver hand the
+            # handler a null vmField/vmMethod, and the handler then silently does
+            # nothing -- which is exactly why so many opcodes look identical under
+            # the probe. Hand back a distinct non-null block instead so the handler
+            # actually dereferences something and we can tell them apart.
+            if not got and os.environ.get('UNMMP_JNI_FAKE') == '1':
+                got = self._fake_id(kind, (cls, name, sig))
+            return got
         if idx in (21, 22, 25):
             return a[1]
         if idx in (23, 17):
@@ -375,6 +386,20 @@ class NativeRuntime:
                 self.events.append(('jni_unknown', idx))
             return 0
         raise EmulationError('unsupported JNI call %d' % idx)
+
+    def _fake_id(self, kind, key):
+        """PATCH(mmpfit): distinct non-null stand-in for a jfieldID/jmethodID/jclass.
+
+        Zero-filled so a handler that reads a field offset off it sees 0 rather
+        than garbage, but still non-null so the handler takes its "resolved"
+        branch instead of bailing out.
+        """
+        if not hasattr(self, '_fake_ids'):
+            self._fake_ids = {}
+        tag = (kind, key)
+        if tag not in self._fake_ids:
+            self._fake_ids[tag] = self.alloc(64)
+        return self._fake_ids[tag]
 
     def libc(self, name):
         a = self.args(4)
