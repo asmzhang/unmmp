@@ -8,9 +8,22 @@ from .handlers import find_handler_table
 
 
 class InstructionProbe:
-    def __init__(self, runtime):
+    """Measure one VM instruction at its next dispatch boundary.
+
+    ``dex`` is optional.  When given, the method slot of the resolver returns a
+    ``vmMethod`` carrying the *real* shorty of the referenced method instead of
+    the synthetic ``II`` placeholder.  That matters because this VM derives the
+    JNI call variant from that string: with a placeholder every ``invoke-*``
+    handler takes the same path, with the real shorty they take the one the
+    sample would take.  See ``docs`` in MY_BRANCH.md.
+    """
+
+    def __init__(self, runtime, dex=None):
         self.r = runtime
         self.uc = runtime.uc
+        self.dex = dex
+        self.shorty_cache = {}
+        self.resolved_methods = []
         elf, base = runtime.images[1]
         self.table_va, table = find_handler_table(elf)
         self.heads = {base + elf.code_addr(a) for a in table}
@@ -53,9 +66,55 @@ class InstructionProbe:
         self.entries = 0
         self.last_fetch = None
 
+    @staticmethod
+    def shorty_of(proto):
+        """Dalvik shorty of a prototype string: one char for the return type
+        followed by one char per parameter.  Reference types (including arrays)
+        collapse to ``L``; wide types keep ``J``/``D`` and count once."""
+        if not proto.startswith('(') or ')' not in proto:
+            return None
+        head, tail = proto.split(')', 1)
+        params, i = head[1:], 0
+        out = []
+        while i < len(params):
+            if params[i] == '[':
+                while params[i] == '[':
+                    i += 1
+                if params[i] == 'L':
+                    i = params.index(';', i) + 1
+                else:
+                    i += 1
+                out.append('L')
+            elif params[i] == 'L':
+                i = params.index(';', i) + 1
+                out.append('L')
+            else:
+                out.append(params[i])
+                i += 1
+        if not tail:
+            return None
+        ret = 'L' if tail[0] in '[L' else tail[0]
+        return ret + ''.join(out)
+
+    def _shorty_at(self, idx):
+        if idx in self.shorty_cache:
+            return self.shorty_cache[idx]
+        ptr = self.shorty  # fall back to the placeholder
+        if self.dex is not None and 0 <= idx < len(self.dex.methods):
+            cls, name, proto = self.dex.methods[idx]
+            text = self.shorty_of(proto)
+            if text:
+                ptr = self.r.alloc(len(text) + 1, text.encode('ascii') + b'\0')
+                self.resolved_methods.append((idx, cls, name, proto, text))
+        self.shorty_cache[idx] = ptr
+        return ptr
+
     def resolve(self, index):
         args = self.r.args(3)
         self.r.events.append(('resolve', index, args[1], args[2] if index < 2 else 0))
+        if index == 1 and self.dex is not None:
+            # vmMethod is {u2 classIdx; const char *shorty; jmethodID methodId}
+            self.r.write_ptr(self.method + self.r.ptr, self._shorty_at(args[1]))
         return [self.field, self.method, self.type_name, self.handle, self.handle,
                 self.r.handle('string', 'probe')][index]
 
