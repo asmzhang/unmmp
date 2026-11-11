@@ -13,6 +13,45 @@ from unicorn import (Uc, UcError, UC_ARCH_ARM, UC_ARCH_ARM64, UC_ARCH_X86,
 from unicorn import arm_const as ar, arm64_const as aa, x86_const as xx
 
 
+
+JNI_FIELD_OPS = {}
+JNI_FIELD_OPS[95] = ('get', 'object', False)   # GetObjectField
+JNI_FIELD_OPS[104] = ('put', 'object', False)   # SetObjectField
+JNI_FIELD_OPS[96] = ('get', 'boolean', False)   # GetBooleanField
+JNI_FIELD_OPS[105] = ('put', 'boolean', False)   # SetBooleanField
+JNI_FIELD_OPS[97] = ('get', 'byte', False)   # GetByteField
+JNI_FIELD_OPS[106] = ('put', 'byte', False)   # SetByteField
+JNI_FIELD_OPS[98] = ('get', 'char', False)   # GetCharField
+JNI_FIELD_OPS[107] = ('put', 'char', False)   # SetCharField
+JNI_FIELD_OPS[99] = ('get', 'short', False)   # GetShortField
+JNI_FIELD_OPS[108] = ('put', 'short', False)   # SetShortField
+JNI_FIELD_OPS[100] = ('get', 'int', False)   # GetIntField
+JNI_FIELD_OPS[109] = ('put', 'int', False)   # SetIntField
+JNI_FIELD_OPS[101] = ('get', 'long', False)   # GetLongField
+JNI_FIELD_OPS[110] = ('put', 'long', False)   # SetLongField
+JNI_FIELD_OPS[102] = ('get', 'float', False)   # GetFloatField
+JNI_FIELD_OPS[111] = ('put', 'float', False)   # SetFloatField
+JNI_FIELD_OPS[103] = ('get', 'double', False)   # GetDoubleField
+JNI_FIELD_OPS[112] = ('put', 'double', False)   # SetDoubleField
+JNI_FIELD_OPS[145] = ('get', 'object', True)    # GetStaticObjectField
+JNI_FIELD_OPS[154] = ('put', 'object', True)    # SetStaticObjectField
+JNI_FIELD_OPS[146] = ('get', 'boolean', True)    # GetStaticBooleanField
+JNI_FIELD_OPS[155] = ('put', 'boolean', True)    # SetStaticBooleanField
+JNI_FIELD_OPS[147] = ('get', 'byte', True)    # GetStaticByteField
+JNI_FIELD_OPS[156] = ('put', 'byte', True)    # SetStaticByteField
+JNI_FIELD_OPS[148] = ('get', 'char', True)    # GetStaticCharField
+JNI_FIELD_OPS[157] = ('put', 'char', True)    # SetStaticCharField
+JNI_FIELD_OPS[149] = ('get', 'short', True)    # GetStaticShortField
+JNI_FIELD_OPS[158] = ('put', 'short', True)    # SetStaticShortField
+JNI_FIELD_OPS[150] = ('get', 'int', True)    # GetStaticIntField
+JNI_FIELD_OPS[159] = ('put', 'int', True)    # SetStaticIntField
+JNI_FIELD_OPS[151] = ('get', 'long', True)    # GetStaticLongField
+JNI_FIELD_OPS[160] = ('put', 'long', True)    # SetStaticLongField
+JNI_FIELD_OPS[152] = ('get', 'float', True)    # GetStaticFloatField
+JNI_FIELD_OPS[161] = ('put', 'float', True)    # SetStaticFloatField
+JNI_FIELD_OPS[153] = ('get', 'double', True)    # GetStaticDoubleField
+JNI_FIELD_OPS[162] = ('put', 'double', True)    # SetStaticDoubleField
+
 class EmulationError(RuntimeError):
     pass
 
@@ -304,22 +343,35 @@ class NativeRuntime:
                                            'sig': self.cstring(self.read_ptr(p + self.ptr)),
                                            'entry': self.read_ptr(p + 2 * self.ptr)})
             return 0
-        if idx in (33, 113, 94, 144, 95, 96, 97, 145, 146, 147):
-            # PATCH(mmpfit): upstream only modelled GetFieldID(94) / GetMethodID(33,113).
-            # The shell also uses the static variants (95/96/97) during <clinit>,
-            # so map those onto the same field/method resolution path.
+        if idx in (33, 113, 94, 144):
+            # PATCH(mmpfit): only the four ID lookups belong here.  Reading jni.h's
+            # JNINativeInterface order settles what 95/96/97 and 145/146/147 are:
+            #   94 GetFieldID        95..103  Get{T}Field       104..112 Set{T}Field
+            #  144 GetStaticFieldID  145..153 GetStatic{T}Field 154..162 SetStatic{T}Field
+            # Treating a getter as an ID lookup is exactly what made a dozen
+            # unrelated opcodes all look like one "invoke" family.
             cls, name, sig = self.classes[a[1]], self.cstring(a[2]), self.cstring(a[3])
-            kind = 'method' if idx in (33, 113, 96, 97, 146, 147) else 'field'
-            self.events.append((kind, cls, name, sig, idx in (113, 144, 95, 145)))
+            kind = 'field' if idx in (94, 144) else 'method'
+            self.events.append((kind, cls, name, sig, idx in (113, 144)))
             got = self.handle(kind, (cls, name, sig))
             # PATCH(mmpfit): a null jfieldID/jmethodID makes the resolver hand the
             # handler a null vmField/vmMethod, and the handler then silently does
-            # nothing -- which is exactly why so many opcodes look identical under
-            # the probe. Hand back a distinct non-null block instead so the handler
-            # actually dereferences something and we can tell them apart.
+            # nothing -- which is why so many opcodes look identical under the probe.
             if not got and os.environ.get('UNMMP_JNI_FAKE') == '1':
                 got = self._fake_id(kind, (cls, name, sig))
             return got
+        if idx in JNI_FIELD_OPS:
+            # The JNI index alone carries src/dst and width, i.e. exactly the
+            # iget-object vs sput-char distinction we are trying to name.
+            what, ftype, is_static = JNI_FIELD_OPS[idx]
+            self.events.append(('field-' + what, ftype, idx, is_static))
+            if what == 'get':
+                if ftype == 'object':
+                    return self.handle('object', 'field')
+                if ftype in ('long', 'double'):
+                    return 0x1122334455667788
+                return 0x13579
+            return 0
         if idx in (21, 22, 25):
             return a[1]
         if idx in (23, 17):
